@@ -100,7 +100,11 @@ impl EmbeddingEngine {
         // multi-threaded, GPU-capable providers. Extractive ranking stays
         // deterministic regardless via score quantization; this is extra hardening.
         let deterministic = deterministic_inference();
-        let eps = crate::core::ort_execution_providers::gpu_execution_providers();
+        let eps = if deterministic {
+            vec![ort::ep::CPU::default().build()]
+        } else {
+            crate::core::ort_execution_providers::gpu_execution_providers()
+        };
         let num_cpus = if deterministic {
             1
         } else {

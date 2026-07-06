@@ -79,16 +79,35 @@ struct OrtApiBase {
 }
 
 fn validate_ort_dylib_version(path: &Path) -> anyhow::Result<()> {
+    // SAFETY: the path was resolved by resolve_ort_dylib; loading a shared
+    // library executes its initializers, which is the accepted risk of any
+    // dlopen-based ORT discovery (same trust boundary as ort::init_from).
     let lib = unsafe { libloading::Library::new(path) }
         .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", path.display()))?;
+    // SAFETY: OrtGetApiBase is the stable C entry point every ONNX Runtime
+    // exports; the signature matches the ORT C API declaration.
     let get_api_base: libloading::Symbol<OrtGetApiBase> = unsafe { lib.get(b"OrtGetApiBase") }
         .map_err(|_| anyhow::anyhow!("{} does not export OrtGetApiBase", path.display()))?;
+    // SAFETY: the symbol was just resolved from the loaded library and takes
+    // no arguments; it returns a pointer we null-check before use.
     let base = unsafe { get_api_base() };
-    anyhow::ensure!(!base.is_null(), "OrtGetApiBase returned null for {}", path.display());
+    anyhow::ensure!(
+        !base.is_null(),
+        "OrtGetApiBase returned null for {}",
+        path.display()
+    );
 
+    // SAFETY: base is non-null (checked above) and points to the static
+    // OrtApiBase; GetVersionString takes no arguments.
     let version = unsafe { ((*base).get_version_string)() };
+    // SAFETY: GetVersionString returns a static NUL-terminated C string owned
+    // by the runtime for the lifetime of the library.
     let version = unsafe { CStr::from_ptr(version) }.to_string_lossy();
-    let minor = version.split('.').nth(1).and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    let minor = version
+        .split('.')
+        .nth(1)
+        .and_then(|part| part.parse::<u32>().ok())
+        .unwrap_or(0);
     anyhow::ensure!(
         minor >= ort::MINOR_VERSION,
         "{} is ONNX Runtime {version}, but this lean-ctx build requires ONNX Runtime >= 1.{}.x; install a matching onnxruntime package or point ORT_DYLIB_PATH at a newer libonnxruntime",
