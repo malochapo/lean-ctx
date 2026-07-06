@@ -15,6 +15,7 @@
 //! If no copy is found, [`ensure_ort_env`] returns an eager error — session
 //! creation hangs rather than failing, so we fail fast.
 
+use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -54,13 +55,46 @@ fn init_ort(eps: &[ExecutionProviderDispatch]) -> anyhow::Result<()> {
     let path = resolve_ort_dylib()?;
 
     tracing::debug!("Loading libonnxruntime from {}", path.display());
-    ort::init_from(&path)
-        .map_err(|e| anyhow::anyhow!("ort::init_from({}) failed: {e}", path.display()))?
-        .with_name("lean-ctx")
+    validate_ort_dylib_version(&path)?;
+    tracing::debug!("Calling ort::init_from");
+    let init = ort::init_from(&path)
+        .map_err(|e| anyhow::anyhow!("ort::init_from({}) failed: {e}", path.display()))?;
+    tracing::debug!("ort::init_from returned; committing ONNX Runtime environment");
+    init.with_name("lean-ctx")
         .with_execution_providers(eps)
         .commit();
+    tracing::debug!("ONNX Runtime environment commit returned");
 
     tracing::info!("ONNX Runtime initialised ({})", path.display());
+    Ok(())
+}
+
+type OrtGetApiBase = unsafe extern "C" fn() -> *const OrtApiBase;
+type GetVersionString = unsafe extern "C" fn() -> *const c_char;
+
+#[repr(C)]
+struct OrtApiBase {
+    get_api: *const c_void,
+    get_version_string: GetVersionString,
+}
+
+fn validate_ort_dylib_version(path: &Path) -> anyhow::Result<()> {
+    let lib = unsafe { libloading::Library::new(path) }
+        .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", path.display()))?;
+    let get_api_base: libloading::Symbol<OrtGetApiBase> = unsafe { lib.get(b"OrtGetApiBase") }
+        .map_err(|_| anyhow::anyhow!("{} does not export OrtGetApiBase", path.display()))?;
+    let base = unsafe { get_api_base() };
+    anyhow::ensure!(!base.is_null(), "OrtGetApiBase returned null for {}", path.display());
+
+    let version = unsafe { ((*base).get_version_string)() };
+    let version = unsafe { CStr::from_ptr(version) }.to_string_lossy();
+    let minor = version.split('.').nth(1).and_then(|part| part.parse::<u32>().ok()).unwrap_or(0);
+    anyhow::ensure!(
+        minor >= ort::MINOR_VERSION,
+        "{} is ONNX Runtime {version}, but this lean-ctx build requires ONNX Runtime >= 1.{}.x; install a matching onnxruntime package or point ORT_DYLIB_PATH at a newer libonnxruntime",
+        path.display(),
+        ort::MINOR_VERSION,
+    );
     Ok(())
 }
 
